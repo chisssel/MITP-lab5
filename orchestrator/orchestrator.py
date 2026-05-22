@@ -84,6 +84,7 @@ class ProductionOrchestrator:
     def __init__(self, logger=None):
         self.logger = logger or logging.getLogger("orchestrator")
         self.metrics = Metrics()
+        self.max_retries = 3
         self.nc: Optional[nats.NATS] = None
         self.results: Dict[str, asyncio.Future] = {}
         self.subscription = None
@@ -128,7 +129,7 @@ class ProductionOrchestrator:
             self.logger.warning("Получен результат для неизвестной задачи %s", task_id)
 
     async def send_task(
-        self, subject: str, task_type: str, payload: dict, timeout: int = 30
+        self, subject: str, task_type: str, payload: dict, timeout: int = 30, retries: int = 0
     ) -> dict:
         task_id = str(uuid.uuid4())
         task = {"id": task_id, "type": task_type, "payload": json.dumps(payload)}
@@ -159,6 +160,31 @@ class ProductionOrchestrator:
                 "agent": "timeout",
             }
 
+    async def send_task_with_retry(
+        self, subject: str, task_type: str, payload: dict,
+        timeout: int = 30, max_retries: int = 3
+    ) -> dict:
+        last_result = None
+        for attempt in range(1, max_retries + 1):
+            result = await self.send_task(subject, task_type, payload, timeout)
+            if result.get("success"):
+                return result
+            last_result = result
+            if attempt < max_retries:
+                delay = min(attempt * 2, 10)
+                self.logger.warning(
+                    "ПОВТОР %d/%d: задача типа '%s' через %dс",
+                    attempt, max_retries, task_type, delay,
+                )
+                await asyncio.sleep(delay)
+        self.logger.error(
+            "ОТМЕНА: задача типа '%s' не выполнена после %d попыток",
+            task_type, max_retries,
+        )
+        return last_result or {
+            "task_id": "", "success": False, "output": "{}", "agent": "retry_exhausted",
+        }
+
     # ---- workflow steps ----
 
     async def plan_production(self, order: dict) -> dict:
@@ -171,8 +197,8 @@ class ProductionOrchestrator:
             order["deadline"], order["priority"],
         )
 
-        result = await self.send_task(
-            "production.planning", "planning", order, timeout=15
+        result = await self.send_task_with_retry(
+            "production.planning", "planning", order, timeout=15, max_retries=self.max_retries
         )
 
         if result.get("success"):
@@ -198,11 +224,11 @@ class ProductionOrchestrator:
         self.logger.info("=" * 50)
         self.logger.info("Материал: %s, требуется: %d", material, required_qty)
 
-        result = await self.send_task(
+        result = await self.send_task_with_retry(
             "production.inventory", "inventory_check",
             {"request_type": "check", "material": material,
              "required_qty": required_qty},
-            timeout=10,
+            timeout=10, max_retries=self.max_retries,
         )
 
         if result.get("success"):
@@ -221,11 +247,11 @@ class ProductionOrchestrator:
         self.logger.info("ШАГ 3: РЕЗЕРВ МАТЕРИАЛОВ")
         self.logger.info("=" * 50)
 
-        result = await self.send_task(
+        result = await self.send_task_with_retry(
             "production.inventory", "inventory_reserve",
             {"request_type": "reserve", "material": material,
              "required_qty": required_qty},
-            timeout=10,
+            timeout=10, max_retries=self.max_retries,
         )
 
         if result.get("success"):
@@ -246,7 +272,7 @@ class ProductionOrchestrator:
         self.logger.info("=" * 50)
         self.logger.info("Заказ: %s, приоритет: %s", order_id, priority)
 
-        result = await self.send_task(
+        result = await self.send_task_with_retry(
             "production.dispatch", "dispatch",
             {
                 "order_id": order_id,
@@ -254,7 +280,7 @@ class ProductionOrchestrator:
                 "priority": priority,
                 "start_after": datetime.now().strftime("%H:%M %d.%m.%Y"),
             },
-            timeout=15,
+            timeout=15, max_retries=self.max_retries,
         )
 
         if result.get("success"):
@@ -278,7 +304,7 @@ class ProductionOrchestrator:
         self.logger.info("Партия: %s, продукт: %s, объём: %d",
                           batch_id, product, quantity)
 
-        result = await self.send_task(
+        result = await self.send_task_with_retry(
             "production.quality", "quality_check",
             {
                 "batch_id": batch_id,
@@ -286,7 +312,7 @@ class ProductionOrchestrator:
                 "quantity": quantity,
                 "measurements": [],
             },
-            timeout=15,
+            timeout=15, max_retries=self.max_retries,
         )
 
         if result.get("success"):

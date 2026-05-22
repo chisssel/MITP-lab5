@@ -241,6 +241,7 @@ async def test_dispatch_format():
 async def test_run_production_cycle_partial_failure():
     """Cycle continues even if some steps fail."""
     o = ProductionOrchestrator()
+    o.max_retries = 1
     o.nc = AsyncMock()
     o.nc.publish = AsyncMock()
     o.subscription = MagicMock()
