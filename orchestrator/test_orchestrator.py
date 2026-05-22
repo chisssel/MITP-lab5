@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from orchestrator import ProductionOrchestrator
+from orchestrator import ProductionOrchestrator, setup_logging
 
 
 @pytest.mark.asyncio
@@ -17,16 +17,19 @@ async def test_init_state():
 
 
 @pytest.mark.asyncio
-async def test_demo_mode(capsys):
-    o = ProductionOrchestrator()
+async def test_demo_mode():
+    import io
+    stream = io.StringIO()
+    logger = setup_logging(stream=stream)
+    o = ProductionOrchestrator(logger=logger)
     await o.demo_mode()
 
-    captured = capsys.readouterr()
-    assert "ДЕМО-РЕЖИМ" in captured.out
-    assert "Планирование загрузки" in captured.out
-    assert "Проверка запасов" in captured.out
-    assert "Диспетчеризация" in captured.out
-    assert "Контроль качества" in captured.out
+    output = stream.getvalue()
+    assert "ДЕМО-РЕЖИМ" in output
+    assert "Планирование загрузки" in output
+    assert "Проверка запасов" in output
+    assert "Диспетчеризация" in output
+    assert "Контроль качества" in output
 
 
 @pytest.mark.asyncio
