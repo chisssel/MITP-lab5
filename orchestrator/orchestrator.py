@@ -26,7 +26,6 @@ class ProductionOrchestrator:
             await self.subscription.unsubscribe()
         if self.nc:
             await self.nc.drain()
-            self.nc.close()
 
     async def _on_result(self, msg):
         data = json.loads(msg.data.decode())
@@ -172,7 +171,7 @@ class ProductionOrchestrator:
                   f"брак={output.get('defect_rate')}%, "
                   f"годных={output.get('passed_pct')}%")
             for defect in output.get("defects", []):
-                print(f"    - ДЕФЕКТ: {defect['param']} ({defect['deviation']}%, {defect['severity']})")
+                print(f"    - ДЕФЕКТ: {defect['param']} ({defect['deviation_pct']}%, {defect['severity']})")
             if output.get("rework_note"):
                 print(f"  ПРИМЕЧАНИЕ: {output['rework_note']}")
             if output.get("reject_note"):
