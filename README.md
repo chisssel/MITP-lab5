@@ -8,54 +8,118 @@
 
 ## Архитектура
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    PYTHON ORCHESTRATOR                   │
-│  Отправляет задачи, собирает результаты, координирует    │
-│  5-шаговый производственный workflow                     │
-└──────┬──────────┬──────────┬──────────┬──────────────────┘
-       │          │          │          │
-       ▼          ▼          ▼          ▼
-┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
-│ Planning │ Quality   │ Inventory │ Dispatch │
-│ Load     │ Control   │ Manager   │ Agent    │
-│ Agent    │ Agent     │ Agent     │          │
-│ (Go)     │ (Go)      │ (Go)      │ (Go)     │
-└──────────┘ └──────────┘ └──────────┘ └──────────┘
-       │          │          │          │
-       └──────────┴──────────┴──────────┘
-                          │
-                    ┌─────▼─────┐
-                    │NATS Broker│
-                    └───────────┘
+```mermaid
+flowchart TB
+    subgraph API["REST API (FastAPI)"]
+        api["POST /production/cycle<br/>POST /production/planning<br/>POST /production/inventory<br/>POST /production/dispatch<br/>POST /production/quality<br/>GET /metrics<br/>GET /health"]
+    end
+
+    subgraph Orchestrator["Оркестратор (Python 3.13+)"]
+        O["ProductionOrchestrator<br/>asyncio + nats-py"]
+        M["Metrics"]
+        R["send_task_with_retry<br/>3 retries, backoff"]
+    end
+
+    subgraph NATS["NATS Broker (Docker)"]
+        direction LR
+        planning_sub["production.planning<br/>(queue group)"]
+        quality_sub["production.quality"]
+        inventory_sub["production.inventory"]
+        dispatch_sub["production.dispatch"]
+        completed["production.completed"]
+    end
+
+    subgraph Agents["Go-агенты (Go 1.24+)"]
+        direction TB
+        LP["load_planner<br/>Планирование загрузки"]
+        QC["quality_control<br/>Контроль качества"]
+        INV["inventory<br/>Управление запасами"]
+        DSP["dispatcher<br/>Диспетчеризация"]
+    end
+
+    API -->|"HTTP JSON"| Orchestrator
+    O -->|"publish"| planning_sub
+    O -->|"publish"| quality_sub
+    O -->|"publish"| inventory_sub
+    O -->|"publish"| dispatch_sub
+    planning_sub -->|"QueueSubscribe"| LP
+    quality_sub -->|"Subscribe"| QC
+    inventory_sub -->|"Subscribe"| INV
+    dispatch_sub -->|"Subscribe"| DSP
+    LP -->|"publish"| completed
+    QC -->|"publish"| completed
+    INV -->|"publish"| completed
+    DSP -->|"publish"| completed
+    completed -->|"cb=_on_result"| O
+    O -->|"Metrics & log"| M
 ```
 
-### Компоненты
+### Диаграмма последовательности (производственный цикл)
 
-| Компонент | Язык | Роль |
-|---|---|---|
-| **Оркестратор** | Python 3.13+ | Центральный управляющий компонент: отправляет задачи, ожидает результаты, обрабатывает таймауты, выполняет 5-шаговый workflow |
-| **Planning Agent** | Go 1.24+ | Планирование загрузки производственных мощностей |
-| **Quality Control Agent** | Go 1.24+ | Контроль качества выпущенной продукции |
-| **Inventory Agent** | Go 1.24+ | Управление складскими запасами |
-| **Dispatcher Agent** | Go 1.24+ | Диспетчеризация заданий по производственным линиям |
-| **NATS** | Docker | Брокер сообщений (асинхронная коммуникация) |
+```mermaid
+sequenceDiagram
+    participant API as REST API
+    participant O as Orchestrator
+    participant N as NATS
+    participant LP as load_planner
+    participant INV as inventory
+    participant DSP as dispatcher
+    participant QC as quality_control
+
+    API->>O: POST /production/cycle
+    O->>N: publish production.planning
+    N->>LP: QueueSubscribe
+    LP-->>N: publish production.completed
+    N-->>O: _on_result
+    O->>N: publish production.inventory (check)
+    N->>INV: Subscribe
+    INV-->>N: publish production.completed
+    N-->>O: _on_result
+    O->>N: publish production.inventory (reserve)
+    N->>INV: Subscribe
+    INV-->>N: publish production.completed
+    N-->>O: _on_result
+    O->>N: publish production.dispatch
+    N->>DSP: Subscribe
+    DSP-->>N: publish production.completed
+    N-->>O: _on_result
+    O->>N: publish production.quality
+    N->>QC: Subscribe
+    QC-->>N: publish production.completed
+    N-->>O: _on_result
+    O-->>API: 200 { results, metrics }
+```
+
+### Компоненты системы
+
+| Компонент | Язык | Технологии | Роль |
+|---|---|---|---|
+| **REST API** | Python 3.13+ | FastAPI, Pydantic, uvicorn | HTTP-интерфейс для запуска задач, валидация запросов, метрики |
+| **Оркестратор** | Python 3.13+ | asyncio, nats-py | Координация 5-шагового workflow, таймауты, ретраи, демо-режим |
+| **load_planner** | Go 1.24+ | NATS, QueueSubscribe | Планирование загрузки производственных мощностей |
+| **quality_control** | Go 1.24+ | NATS | Контроль качества выпущенной продукции |
+| **inventory** | Go 1.24+ | NATS | Управление складскими запасами |
+| **dispatcher** | Go 1.24+ | NATS | Диспетчеризация заданий по производственным линиям |
+| **NATS** | — | Docker | Асинхронный брокер сообщений (sub/pub) |
 
 ### Агенты и их бизнес-логика
 
 #### 1. Планирование загрузки (`load_planner`)
+- **Subject**: `production.planning` (Queue group: `planning-workers`)
 - **Вход**: `{ order_id, product, quantity, deadline, priority }`
-- **Выход**: `{ order_id, feasible, schedule: [{ machine, start_time, end_time, task }], total_time_mins, utilization_pct }`
+- **Выход**: `{ order_id, feasible, schedule, total_time_mins, utilization_pct }`
 - **Правила**:
   - Приоритет влияет на скорость обработки (critical ×2.0, high ×1.5, normal ×1.0, low ×0.5)
   - Загрузка станка не более 100%
   - Технологический перерыв 15 мин между операциями
   - Если deadline нереалистичен → `feasible: false` с рекомендацией
   - Critical-заказы выполняются даже при превышении дедлайна
+  - **Балансировка**: QueueSubscribe распределяет задачи между экземплярами (AGENT_ID)
 
 #### 2. Контроль качества (`quality_control`)
-- **Вход**: `{ batch_id, product, quantity, measurements: [{ param, value, nominal, unit, critical }] }`
-- **Выход**: `{ batch_id, status, defect_rate, passed_pct, defects, rework_note, reject_note }`
+- **Subject**: `production.quality`
+- **Вход**: `{ batch_id, product, quantity, measurements }`
+- **Выход**: `{ batch_id, status, defect_rate, passed_pct, defects }`
 - **Правила**:
   - Допуск: ±5% для обычных, ±1% для критических параметров
   - Если `defect_rate > 10%` или есть critical-дефект → `rejected`
@@ -64,8 +128,9 @@
   - Если измерения не переданы — генерируются автоматически
 
 #### 3. Управление запасами (`inventory`)
-- **Вход**: `{ request_type: "check"|"reserve"|"restock", material, required_qty, warehouse_id }`
-- **Выход**: `{ request_id, status, available_qty, reserved_qty, safety_stock, estimated_arrival }`
+- **Subject**: `production.inventory`
+- **Вход**: `{ request_type: "check"|"reserve"|"restock", material, required_qty }`
+- **Выход**: `{ request_id, status, available_qty, reserved_qty, safety_stock }`
 - **Правила**:
   - Страховой запас: 15% от среднемесячного расхода
   - При дефиците автоматически оформляется заказ поставщику
@@ -73,8 +138,9 @@
   - Три режима: check (проверка), reserve (резервирование), restock (пополнение)
 
 #### 4. Диспетчеризация (`dispatcher`)
-- **Вход**: `{ order_id, schedule: [{ machine, task, duration_mins }], priority, start_after }`
-- **Выход**: `{ order_id, dispatch_id, lines: [{ line, task, status, actual_start, expected_end }], overall_status }`
+- **Subject**: `production.dispatch`
+- **Вход**: `{ order_id, schedule, priority, start_after }`
+- **Выход**: `{ order_id, dispatch_id, lines, overall_status }`
 - **Правила**:
   - Задание назначается на линию с наименьшей загрузкой
   - Одна линия — одно задание за раз
@@ -82,15 +148,30 @@
   - Critical/high приоритет может прерывать выполнение обычных заказов
   - При пустом расписании генерируется расписание по умолчанию
 
+### Управление экземплярами и нагрузкой
+
+**Балансировка (Task 7):**
+- `load_planner` использует `QueueSubscribe("production.planning", "planning-workers")`
+- NATS автоматически распределяет задачи round-robin между экземплярами
+- `AGENT_ID` env var идентифицирует каждый экземпляр в логах и ответах
+
+```
+load_planner_1: 2 задачи
+load_planner_2: 3 задачи
+load_planner_3: 1 задача  ← 6 задач распределены между 3 инстансами
+```
+
 ### Производственный workflow (оркестрация)
 
 ```
-ШАГ 1: production.planning   → Планирование загрузки
-ШАГ 2: production.inventory  → Проверка запасов
-ШАГ 3: production.inventory  → Резерв материалов
-ШАГ 4: production.dispatch   → Диспетчеризация
-ШАГ 5: production.quality    → Контроль качества
+ШАГ 1: production.planning   → Планирование загрузки       (timeout: 15с, retry: 3)
+ШАГ 2: production.inventory  → Проверка запасов (check)    (timeout: 10с, retry: 3)
+ШАГ 3: production.inventory  → Резерв материалов (reserve) (timeout: 10с, retry: 3)
+ШАГ 4: production.dispatch   → Диспетчеризация             (timeout: 15с, retry: 3)
+ШАГ 5: production.quality    → Контроль качества            (timeout: 15с, retry: 3)
 ```
+
+Каждый шаг использует `send_task_with_retry`: до 3 попыток с backoff (2с, 4с, 6с).
 
 ---
 
@@ -203,7 +284,7 @@ python orchestrator/orchestrator.py --demo
 
 ## Тестирование
 
-### Go-тесты агентов (37 тестов)
+### Go-тесты агентов (49 тестов)
 
 ```bash
 # Все тесты
@@ -218,14 +299,14 @@ go test ./agents/shared/ -v
 ```
 
 | Пакет | Тестов | Что покрывают |
-|---|---|---|
-| `shared` | 4 | JSON-сериализация Task/Result |
-| `load_planner` | 7 | Приоритеты, дедлайны, граничные случаи |
-| `quality_control` | 9 | Допуски, статусы (passed/rework/rejected), границы 0%/100% |
+|---|---|---|---|
+| `shared` | 19 | JSON-сериализация Task/Result, AgentLogger, Metrics, concurency, граничные случаи |
+| `load_planner` | 7 | Приоритеты, дедлайны, граничные случаи, утилизация |
+| `quality_control` | 9 | Допуски, статусы (passed/rework/rejected), границы 0%/100%, генерация выборки |
 | `inventory` | 9 | Check/reserve/restock, неизвестные материалы, состояние склада |
-| `dispatcher` | 8 | Расписания, очереди, прерывания, утилиты |
+| `dispatcher` | 8 | Расписания, очереди, прерывания, утилиты itoa/stringsEqualFold |
 
-### Python-тесты оркестратора (13 тестов)
+### Python-тесты оркестратора (31 тест)
 
 ```bash
 cd orchestrator
@@ -238,9 +319,12 @@ pytest test_orchestrator.py -v
 | Инициализация, методы send_task / _on_result |
 | Таймауты (при отсутствии подписчика) |
 | Корректность payload каждого из 5 шагов workflow |
-| Устойчивость к частичным отказам |
-| Параллельные задачи |
+| Устойчивость к частичным отказам, retry-логика (3 попытки, backoff) |
+| Параллельные задачи и конкурентные ретраи |
 | Ошибка подключения к NATS |
+| Класс Metrics (счётчики, summary, report, uptime) |
+| Unicode-нагрузка, очистка results после таймаута |
+| `__init__` exports |
 
 ### Интеграционный тест (NATS e2e)
 
@@ -250,6 +334,69 @@ python test_integration.py
 ```
 
 Проверяет сквозную коммуникацию: все 4 агента получают задачи через NATS и возвращают корректные ответы.
+
+---
+
+## REST API (FastAPI)
+
+Файл: `orchestrator/api.py`
+
+HTTP-интерфейс для запуска производственных задач через оркестратор.
+
+### Эндпоинты
+
+| Метод | Путь | Описание |
+|-------|------|----------|
+| `GET` | `/` | Список доступных эндпоинтов |
+| `GET` | `/health` | Статус сервиса и подключения к NATS |
+| `GET` | `/metrics` | Метрики оркестратора |
+| `POST` | `/production/cycle` | Полный производственный цикл (5 шагов) |
+| `POST` | `/production/planning` | Планирование загрузки |
+| `POST` | `/production/inventory` | Проверка/резерв запасов |
+| `POST` | `/production/dispatch` | Диспетчеризация |
+| `POST` | `/production/quality` | Контроль качества |
+
+### Пример запроса
+
+```bash
+curl -X POST http://localhost:8000/production/cycle \
+  -H "Content-Type: application/json" \
+  -d '{"order_id":"ORD-001","product":"Шестерня","quantity":500,"priority":"high"}'
+```
+
+### Ответ (200 OK)
+
+```json
+{
+  "order": {
+    "order_id": "ORD-001",
+    "product": "Шестерня",
+    "quantity": 500,
+    "deadline": "05:55 23.05.2026",
+    "priority": "high"
+  },
+  "metrics": {
+    "tasks_sent": 8,
+    "tasks_completed": 5,
+    "tasks_timeout": 2,
+    "tasks_failed": 0,
+    "uptime_sec": 73.3
+  },
+  "results": {
+    "planning": { "success": true, "output": { "feasible": true, ... } },
+    "inventory_check": { "success": true, "output": { ... } },
+    "inventory_reserve": { "success": true, "output": { ... } },
+    "dispatch": { "success": true, "output": { ... } },
+    "quality_control": { "success": true, "output": { ... } }
+  }
+}
+```
+
+### Запуск
+
+```bash
+uvicorn orchestrator.api:app --host 127.0.0.1 --port 8000
+```
 
 ---
 
@@ -263,25 +410,32 @@ lab5/
 ├── agents/
 │   ├── shared/
 │   │   ├── types.go                # Task / Result — общий контракт
-│   │   └── types_test.go           # Тесты shared-типов
+│   │   ├── types_test.go           # Тесты типов
+│   │   ├── logging.go              # AgentLogger (file+console, INFO/WARN/ERROR)
+│   │   ├── logging_test.go         # Тесты логгера и метрик
+│   │   └── metrics.go              # Metrics (atomic counters, report)
 │   ├── cmd/
 │   │   ├── load_planner/
 │   │   │   ├── main.go             # Агент планирования загрузки
-│   │   │   └── main_test.go        # Тесты
+│   │   │   └── main_test.go        # Тесты (7)
 │   │   ├── quality_control/
 │   │   │   ├── main.go             # Агент контроля качества
-│   │   │   └── main_test.go        # Тесты
+│   │   │   └── main_test.go        # Тесты (9)
 │   │   ├── inventory/
 │   │   │   ├── main.go             # Агент управления запасами
-│   │   │   └── main_test.go        # Тесты
+│   │   │   └── main_test.go        # Тесты (9)
 │   │   └── dispatcher/
 │   │       ├── main.go             # Агент диспетчеризации
-│   │       └── main_test.go        # Тесты
+│   │       └── main_test.go        # Тесты (8)
 │   └── bin/                        # Скомпилированные бинарники
 ├── orchestrator/
+│   ├── __init__.py                 # Экспорт ProductionOrchestrator, Metrics, setup_logging
 │   ├── requirements.txt            # Зависимости Python
-│   ├── orchestrator.py             # Оркестратор
-│   └── test_orchestrator.py        # Тесты оркестратора
+│   ├── orchestrator.py             # Оркестратор (473 строки)
+│   ├── api.py                      # REST API (FastAPI, 189 строк)
+│   ├── test_orchestrator.py        # Тесты оркестратора (13)
+│   └── test_orchestrator_extra.py  # Доп. тесты: метрики, ретраи, граничные случаи (18)
+├── logs/                           # Логи агентов и оркестратора
 └── test_integration.py             # Интеграционный E2E-тест
 ```
 
