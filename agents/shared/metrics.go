@@ -2,7 +2,7 @@ package shared
 
 import (
 	"fmt"
-	"sync"
+
 	"sync/atomic"
 	"time"
 )
@@ -13,7 +13,7 @@ type Metrics struct {
 	TasksSucceeded  atomic.Int64 `json:"tasks_succeeded"`
 	TasksFailed     atomic.Int64 `json:"tasks_failed"`
 	ProcessingTimeMs atomic.Int64 `json:"processing_time_ms"`
-	mu              sync.Mutex
+
 	startedAt       time.Time
 	logger          *AgentLogger
 }
@@ -54,7 +54,7 @@ func (m *Metrics) LogAndReport() {
 		avgMs = totalTime / succeeded
 	}
 
-	m.mu.Unlock()
+
 
 	m.logger.Info("=== МЕТРИКИ === получено=%d успешно=%d ошибок=%d среднее_время=%dms uptime=%s",
 		received, succeeded, failed, avgMs, uptime)

@@ -53,24 +53,25 @@ var machines = []Machine{
 	{Name: "Packing-1", QtyPerHour: 120, Available: true},
 }
 
-func getLogDir() string {
-	if d := os.Getenv("AGENT_LOG_DIR"); d != "" {
-		return d
+func getEnv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-	return "logs"
+	return def
 }
 
 func main() {
-	logDir := getLogDir()
-	logger, err := shared.NewAgentLogger("load_planner", logDir)
+	logDir := getEnv("AGENT_LOG_DIR", "logs")
+	instID := getEnv("AGENT_ID", "1")
+	logger, err := shared.NewAgentLogger("load_planner_"+instID, logDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "logger init error: %v\n", err)
 		os.Exit(1)
 	}
 	defer logger.Close()
 
-	metrics := shared.NewMetrics("load_planner", logger)
-	logger.Info("Агент запущен, ожидание задач...")
+	metrics := shared.NewMetrics("load_planner_"+instID, logger)
+	logger.Info("Агент #%s запущен, ожидание задач...", instID)
 
 	nc, err := nats.Connect(nats.DefaultURL)
 	if err != nil {
@@ -79,7 +80,7 @@ func main() {
 	}
 	defer nc.Close()
 
-	nc.Subscribe("production.planning", func(m *nats.Msg) {
+	nc.QueueSubscribe("production.planning", "planning-workers", func(m *nats.Msg) {
 		start := time.Now()
 		metrics.IncReceived()
 
@@ -111,7 +112,7 @@ func main() {
 			TaskID:  task.ID,
 			Success: true,
 			Output:  string(output),
-			Agent:   "load_planner",
+			Agent:   "load_planner_" + instID,
 		}
 		response, _ := json.Marshal(res)
 		nc.Publish("production.completed", response)
