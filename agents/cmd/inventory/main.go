@@ -3,9 +3,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"math"
 	"math/rand"
+	"os"
+	"os/signal"
 	"sync"
 	"time"
 
@@ -15,29 +16,29 @@ import (
 )
 
 type InventoryRequest struct {
-	RequestType  string `json:"request_type"`
-	Material     string `json:"material"`
-	RequiredQty  int    `json:"required_qty"`
-	WarehouseID  string `json:"warehouse_id"`
+	RequestType string `json:"request_type"`
+	Material    string `json:"material"`
+	RequiredQty int    `json:"required_qty"`
+	WarehouseID string `json:"warehouse_id"`
 }
 
 type InventoryResult struct {
-	RequestID      string `json:"request_id"`
-	Status         string `json:"status"`
-	Material       string `json:"material"`
-	AvailableQty   int    `json:"available_qty"`
-	ReservedQty    int    `json:"reserved_qty"`
-	SafetyStock    int    `json:"safety_stock"`
-	ReorderUntil   string `json:"reorder_until,omitempty"`
+	RequestID        string `json:"request_id"`
+	Status           string `json:"status"`
+	Material         string `json:"material"`
+	AvailableQty     int    `json:"available_qty"`
+	ReservedQty      int    `json:"reserved_qty"`
+	SafetyStock      int    `json:"safety_stock"`
+	ReorderUntil     string `json:"reorder_until,omitempty"`
 	EstimatedArrival string `json:"estimated_arrival,omitempty"`
-	Note           string `json:"note,omitempty"`
+	Note             string `json:"note,omitempty"`
 }
 
 type StockItem struct {
-	Material    string
-	Available   int
-	Reserved    int
-	AvgMonthly  int
+	Material     string
+	Available    int
+	Reserved     int
+	AvgMonthly   int
 	LeadTimeDays int
 }
 
@@ -60,35 +61,61 @@ func initWarehouse() {
 	}
 }
 
+func getLogDir() string {
+	if d := os.Getenv("AGENT_LOG_DIR"); d != "" {
+		return d
+	}
+	return "logs"
+}
+
 func main() {
+	logDir := getLogDir()
+	logger, err := shared.NewAgentLogger("inventory", logDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "logger init: %v\n", err)
+		os.Exit(1)
+	}
+	defer logger.Close()
+
+	metrics := shared.NewMetrics("inventory", logger)
+	logger.Info("Агент запущен, ожидание задач...")
+
 	nc, err := nats.Connect(nats.DefaultURL)
 	if err != nil {
-		log.Fatalf("Ошибка подключения к NATS: %v", err)
+		logger.Error("Ошибка подключения к NATS: %v", err)
+		os.Exit(1)
 	}
 	defer nc.Close()
 
-	log.Println("[Inventory] Агент запущен, ожидание задач...")
-
 	nc.Subscribe("production.inventory", func(m *nats.Msg) {
+		start := time.Now()
+		metrics.IncReceived()
+
 		initOnce.Do(initWarehouse)
 
 		var task shared.Task
 		if err := json.Unmarshal(m.Data, &task); err != nil {
-			log.Printf("Ошибка разбора задачи: %v", err)
+			logger.Error("Ошибка разбора задачи: %v", err)
+			metrics.IncFailed()
 			return
 		}
 
-		log.Printf("Получена задача %s типа %s", task.ID, task.Type)
+		logger.Info("Получена задача %s типа %s", task.ID, task.Type)
 
 		var req InventoryRequest
 		if err := json.Unmarshal([]byte(task.Payload), &req); err != nil {
-			log.Printf("Ошибка разбора payload: %v", err)
+			logger.Error("Ошибка разбора payload задачи %s: %v", task.ID, err)
+			metrics.IncFailed()
 			return
 		}
 
+		logger.Info("Обработка: type=%s material=%s qty=%d",
+			req.RequestType, req.Material, req.RequiredQty)
+
 		result := manageInventory(req)
 		output, _ := json.Marshal(result)
-		log.Printf("Задача %s выполнена: status=%s, material=%s", task.ID, result.Status, result.Material)
+		logger.Info("Задача %s выполнена: status=%s material=%s",
+			task.ID, result.Status, result.Material)
 
 		res := shared.Result{
 			TaskID:  task.ID,
@@ -98,7 +125,19 @@ func main() {
 		}
 		response, _ := json.Marshal(res)
 		nc.Publish("production.completed", response)
+
+		metrics.IncSucceeded()
+		metrics.AddProcessingTime(time.Since(start).Milliseconds())
 	})
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		<-c
+		logger.Info("Завершение работы...")
+		metrics.LogAndReport()
+		os.Exit(0)
+	}()
 
 	select {}
 }
@@ -108,8 +147,8 @@ func manageInventory(req InventoryRequest) InventoryResult {
 	defer warehouseLock.Unlock()
 
 	res := InventoryResult{
-		RequestID:    req.RequestType + "_" + req.Material,
-		Material:     req.Material,
+		RequestID: req.RequestType + "_" + req.Material,
+		Material:  req.Material,
 	}
 
 	idx := -1

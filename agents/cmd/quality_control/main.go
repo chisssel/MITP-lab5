@@ -2,10 +2,13 @@ package main
 
 import (
 	"encoding/json"
-	"log"
+	"fmt"
 	"math"
 	"math/rand"
+	"os"
+	"os/signal"
 	"strings"
+	"time"
 
 	"lab5/agents/shared"
 
@@ -13,11 +16,11 @@ import (
 )
 
 type Measurement struct {
-	Param string  `json:"param"`
-	Value float64 `json:"value"`
-	Nominal float64 `json:"nominal"`
-	Unit  string  `json:"unit"`
-	Critical bool   `json:"critical"`
+	Param    string  `json:"param"`
+	Value    float64 `json:"value"`
+	Nominal  float64 `json:"nominal"`
+	Unit     string  `json:"unit"`
+	Critical bool    `json:"critical"`
 }
 
 type QCRequest struct {
@@ -44,33 +47,59 @@ type QCResult struct {
 	RejectNote string     `json:"reject_note,omitempty"`
 }
 
+func getLogDir() string {
+	if d := os.Getenv("AGENT_LOG_DIR"); d != "" {
+		return d
+	}
+	return "logs"
+}
+
 func main() {
+	logDir := getLogDir()
+	logger, err := shared.NewAgentLogger("quality_control", logDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "logger init: %v\n", err)
+		os.Exit(1)
+	}
+	defer logger.Close()
+
+	metrics := shared.NewMetrics("quality_control", logger)
+	logger.Info("Агент запущен, ожидание задач...")
+
 	nc, err := nats.Connect(nats.DefaultURL)
 	if err != nil {
-		log.Fatalf("Ошибка подключения к NATS: %v", err)
+		logger.Error("Ошибка подключения к NATS: %v", err)
+		os.Exit(1)
 	}
 	defer nc.Close()
 
-	log.Println("[QualityControl] Агент запущен, ожидание задач...")
-
 	nc.Subscribe("production.quality", func(m *nats.Msg) {
+		start := time.Now()
+		metrics.IncReceived()
+
 		var task shared.Task
 		if err := json.Unmarshal(m.Data, &task); err != nil {
-			log.Printf("Ошибка разбора задачи: %v", err)
+			logger.Error("Ошибка разбора задачи: %v", err)
+			metrics.IncFailed()
 			return
 		}
 
-		log.Printf("Получена задача %s типа %s", task.ID, task.Type)
+		logger.Info("Получена задача %s типа %s", task.ID, task.Type)
 
 		var req QCRequest
 		if err := json.Unmarshal([]byte(task.Payload), &req); err != nil {
-			log.Printf("Ошибка разбора payload: %v", err)
+			logger.Error("Ошибка разбора payload задачи %s: %v", task.ID, err)
+			metrics.IncFailed()
 			return
 		}
 
+		logger.Info("Обработка: batch=%s product=%s qty=%d",
+			req.BatchID, req.Product, req.Quantity)
+
 		result := inspectQuality(req)
 		output, _ := json.Marshal(result)
-		log.Printf("Задача %s выполнена: status=%s", task.ID, result.Status)
+		logger.Info("Задача %s выполнена: status=%s defect_rate=%.1f%%",
+			task.ID, result.Status, result.DefectRate)
 
 		res := shared.Result{
 			TaskID:  task.ID,
@@ -80,7 +109,19 @@ func main() {
 		}
 		response, _ := json.Marshal(res)
 		nc.Publish("production.completed", response)
+
+		metrics.IncSucceeded()
+		metrics.AddProcessingTime(time.Since(start).Milliseconds())
 	})
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		<-c
+		logger.Info("Завершение работы...")
+		metrics.LogAndReport()
+		os.Exit(0)
+	}()
 
 	select {}
 }

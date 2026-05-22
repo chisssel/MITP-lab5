@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
-	"log"
+	"fmt"
 	"math/rand"
+	"os"
+	"os/signal"
 	"sync"
 	"time"
 
@@ -26,29 +28,29 @@ type DispatchRequest struct {
 }
 
 type LineStatus struct {
-	Line          string `json:"line"`
-	Task          string `json:"task"`
-	Status        string `json:"status"`
-	ActualStart   string `json:"actual_start,omitempty"`
-	ExpectedEnd   string `json:"expected_end,omitempty"`
+	Line        string `json:"line"`
+	Task        string `json:"task"`
+	Status      string `json:"status"`
+	ActualStart string `json:"actual_start,omitempty"`
+	ExpectedEnd string `json:"expected_end,omitempty"`
 }
 
 type DispatchResult struct {
-	OrderID        string       `json:"order_id"`
-	DispatchID     string       `json:"dispatch_id"`
-	Lines          []LineStatus `json:"lines"`
-	OverallStatus  string       `json:"overall_status"`
+	OrderID       string       `json:"order_id"`
+	DispatchID    string       `json:"dispatch_id"`
+	Lines         []LineStatus `json:"lines"`
+	OverallStatus string       `json:"overall_status"`
 }
 
 type ProductionLine struct {
-	Name    string
-	Busy    bool
-	Queue   []string
+	Name  string
+	Busy  bool
+	Queue []string
 }
 
 var (
-	lines []*ProductionLine
-	linesLock sync.Mutex
+	lines       []*ProductionLine
+	linesLock   sync.Mutex
 	dispatchCnt int
 )
 
@@ -61,33 +63,59 @@ func init() {
 	}
 }
 
+func getLogDir() string {
+	if d := os.Getenv("AGENT_LOG_DIR"); d != "" {
+		return d
+	}
+	return "logs"
+}
+
 func main() {
+	logDir := getLogDir()
+	logger, err := shared.NewAgentLogger("dispatcher", logDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "logger init: %v\n", err)
+		os.Exit(1)
+	}
+	defer logger.Close()
+
+	metrics := shared.NewMetrics("dispatcher", logger)
+	logger.Info("Агент запущен, ожидание задач...")
+
 	nc, err := nats.Connect(nats.DefaultURL)
 	if err != nil {
-		log.Fatalf("Ошибка подключения к NATS: %v", err)
+		logger.Error("Ошибка подключения к NATS: %v", err)
+		os.Exit(1)
 	}
 	defer nc.Close()
 
-	log.Println("[Dispatcher] Агент запущен, ожидание задач...")
-
 	nc.Subscribe("production.dispatch", func(m *nats.Msg) {
+		start := time.Now()
+		metrics.IncReceived()
+
 		var task shared.Task
 		if err := json.Unmarshal(m.Data, &task); err != nil {
-			log.Printf("Ошибка разбора задачи: %v", err)
+			logger.Error("Ошибка разбора задачи: %v", err)
+			metrics.IncFailed()
 			return
 		}
 
-		log.Printf("Получена задача %s типа %s", task.ID, task.Type)
+		logger.Info("Получена задача %s типа %s", task.ID, task.Type)
 
 		var req DispatchRequest
 		if err := json.Unmarshal([]byte(task.Payload), &req); err != nil {
-			log.Printf("Ошибка разбора payload: %v", err)
+			logger.Error("Ошибка разбора payload задачи %s: %v", task.ID, err)
+			metrics.IncFailed()
 			return
 		}
 
+		logger.Info("Обработка: order=%s priority=%s schedule=%d задач",
+			req.OrderID, req.Priority, len(req.Schedule))
+
 		result := dispatch(req)
 		output, _ := json.Marshal(result)
-		log.Printf("Задача %s выполнена: overall_status=%s", task.ID, result.OverallStatus)
+		logger.Info("Задача %s выполнена: dispatch=%s status=%s",
+			task.ID, result.DispatchID, result.OverallStatus)
 
 		res := shared.Result{
 			TaskID:  task.ID,
@@ -97,7 +125,19 @@ func main() {
 		}
 		response, _ := json.Marshal(res)
 		nc.Publish("production.completed", response)
+
+		metrics.IncSucceeded()
+		metrics.AddProcessingTime(time.Since(start).Milliseconds())
 	})
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		<-c
+		logger.Info("Завершение работы...")
+		metrics.LogAndReport()
+		os.Exit(0)
+	}()
 
 	select {}
 }
@@ -163,7 +203,6 @@ func dispatch(req DispatchRequest) DispatchResult {
 		line.Busy = true
 		endTime := assignedTime.Add(time.Duration(s.Duration) * time.Minute)
 
-		// Simulate random setup delay
 		setupDelay := time.Duration(rand.Intn(10)) * time.Minute
 		actualStart := assignedTime.Add(setupDelay)
 
@@ -176,7 +215,6 @@ func dispatch(req DispatchRequest) DispatchResult {
 		}
 		result.Lines = append(result.Lines, ls)
 
-		// Release line after duration
 		go func(l *ProductionLine, dur time.Duration) {
 			time.Sleep(dur)
 			linesLock.Lock()
@@ -218,7 +256,6 @@ func selectLine(preferredMachine string, isCritical bool) *ProductionLine {
 		}
 	}
 
-	// Find line with least load
 	bestLine := lines[0]
 	minQueue := len(lines[0].Queue)
 	for _, l := range lines[1:] {

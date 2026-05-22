@@ -3,9 +3,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"math"
 	"math/rand"
+	"os"
+	"os/signal"
 	"time"
 
 	"lab5/agents/shared"
@@ -30,18 +31,18 @@ type MachineSlot struct {
 }
 
 type PlanningResult struct {
-	OrderID       string        `json:"order_id"`
-	Feasible      bool          `json:"feasible"`
-	Schedule      []MachineSlot `json:"schedule"`
-	TotalTimeMins int           `json:"total_time_mins"`
-	UtilizationPct float64      `json:"utilization_pct"`
-	Note          string        `json:"note,omitempty"`
+	OrderID        string        `json:"order_id"`
+	Feasible       bool          `json:"feasible"`
+	Schedule       []MachineSlot `json:"schedule"`
+	TotalTimeMins  int           `json:"total_time_mins"`
+	UtilizationPct float64       `json:"utilization_pct"`
+	Note           string        `json:"note,omitempty"`
 }
 
 type Machine struct {
-	Name      string
+	Name       string
 	QtyPerHour int
-	Available bool
+	Available  bool
 }
 
 var machines = []Machine{
@@ -52,33 +53,59 @@ var machines = []Machine{
 	{Name: "Packing-1", QtyPerHour: 120, Available: true},
 }
 
+func getLogDir() string {
+	if d := os.Getenv("AGENT_LOG_DIR"); d != "" {
+		return d
+	}
+	return "logs"
+}
+
 func main() {
+	logDir := getLogDir()
+	logger, err := shared.NewAgentLogger("load_planner", logDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "logger init error: %v\n", err)
+		os.Exit(1)
+	}
+	defer logger.Close()
+
+	metrics := shared.NewMetrics("load_planner", logger)
+	logger.Info("Агент запущен, ожидание задач...")
+
 	nc, err := nats.Connect(nats.DefaultURL)
 	if err != nil {
-		log.Fatalf("Ошибка подключения к NATS: %v", err)
+		logger.Error("Ошибка подключения к NATS: %v", err)
+		os.Exit(1)
 	}
 	defer nc.Close()
 
-	log.Println("[LoadPlanner] Агент запущен, ожидание задач...")
-
 	nc.Subscribe("production.planning", func(m *nats.Msg) {
+		start := time.Now()
+		metrics.IncReceived()
+
 		var task shared.Task
 		if err := json.Unmarshal(m.Data, &task); err != nil {
-			log.Printf("Ошибка разбора задачи: %v", err)
+			logger.Error("Ошибка разбора задачи: %v", err)
+			metrics.IncFailed()
 			return
 		}
 
-		log.Printf("Получена задача %s типа %s", task.ID, task.Type)
+		logger.Info("Получена задача %s типа %s", task.ID, task.Type)
 
 		var req PlanningRequest
 		if err := json.Unmarshal([]byte(task.Payload), &req); err != nil {
-			log.Printf("Ошибка разбора payload: %v", err)
+			logger.Error("Ошибка разбора payload задачи %s: %v", task.ID, err)
+			metrics.IncFailed()
 			return
 		}
 
+		logger.Info("Обработка: order=%s product=%s qty=%d priority=%s",
+			req.OrderID, req.Product, req.Quantity, req.Priority)
+
 		result := planLoad(req)
 		output, _ := json.Marshal(result)
-		log.Printf("Задача %s выполнена: feasible=%v", task.ID, result.Feasible)
+		logger.Info("Задача %s выполнена: feasible=%v schedule=%d слотов",
+			task.ID, result.Feasible, len(result.Schedule))
 
 		res := shared.Result{
 			TaskID:  task.ID,
@@ -88,7 +115,19 @@ func main() {
 		}
 		response, _ := json.Marshal(res)
 		nc.Publish("production.completed", response)
+
+		metrics.IncSucceeded()
+		metrics.AddProcessingTime(time.Since(start).Milliseconds())
 	})
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		<-c
+		logger.Info("Завершение работы...")
+		metrics.LogAndReport()
+		os.Exit(0)
+	}()
 
 	select {}
 }
@@ -169,9 +208,9 @@ func planLoad(req PlanningRequest) PlanningResult {
 	}
 
 	result := PlanningResult{
-		OrderID:   req.OrderID,
-		Schedule:  schedule,
-		Feasible:  remaining <= 0,
+		OrderID:       req.OrderID,
+		Schedule:      schedule,
+		Feasible:      remaining <= 0,
 		TotalTimeMins: int(math.Ceil(totalMins)),
 	}
 
